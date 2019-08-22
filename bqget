@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+
+# =============================================================================
+# bqget: downloads a bigquery TABLE to local directory.
+# Uses bq to download to GCS, then GCS to download to disk. This allows to use
+# compression and gsutil's multithreading and slicing for faster downloads.
+#
+# Usage: bqget DATASET TABLE [FORMAT]
+#
+# Arguments:
+# - DATASET: name of the bq dataset containing the TABLE. Mandatory, positional
+# - TABLE: name of the bq table to download. Mandatory, positional
+# - FORMAT: of the exported file. CSV, NEWLINE_DELIMITED_JSON, or AVRO. Also
+# determines the compression format to be used in the transfer:
+#     - CSV,NEWLY_DELIMITED_JSON use GZIP
+#     - AVRO uses SNAPPY
+#
+# Author: Fernando Sanchez <fernandosanchezmunoz@gmail.com>
+#
+# Version: 0.3
+# =============================================================================
+
+# =============================================================================
+# Default values and arguments
+# =============================================================================
+
+DATASET=$1
+TABLE=$2
+
+#Consider changing these if needed
+LOCATION=US
+#DELIMITER="|" 				#Unsupported by avro #Can be any char ex. "|" "." " "
+PRINT_HEADER=false 			#Whether to print the first/header line of files
+NAME=${DATASET}"-"${TABLE}		#File name format
+
+#gsutil options for faster downloads
+GSUTIL_OPTIONS=" \
+-m \
+-o GSUtil:parallel_thread_count=1 \
+-o GSUtil:sliced_object_download_max_components=8 \
+"
+
+NUM_THREADS_UNZIP=8	#number of parallel threads for decompression
+
+DEFAULT_FORMAT="CSV"
+
+SUPPORTED_FORMATS="
+CSV
+NEWLINE_DELIMITED_JSON
+AVRO
+"
+
+REQUIRED_APIS="
+	bigqueryconnection
+	bigquerydataingestion
+	bigquerydataprovider
+	bigquerydatatransfer
+	bigquerystorage
+	storage-api
+	storage-component
+"
+# =============================================================================
+# Pretty colors
+# =============================================================================
+
+RED='\033[0;31m'
+BLUE='\033[1;34m'
+NC='\033[0m' # No color
+
+# =============================================================================
+# Auxiliary Functions
+# =============================================================================
+
+# Show usage and help
+print_usage() {
+    cat <<EOM
+    Usage:
+
+    $(basename $0) DATASET TABLE [FORMAT]
+
+    Downloads a TABLE located in a BigQuery DATASET to a file in FORMAT to the current directory.
+    TABLE and DATASET must exist in BigQuery in the GCP project currently active.
+    Supported formats:
+    ${SUPPORTED_FORMATS}
+EOM
+}
+
+# Prefix output and write to STDERR:
+error() {
+	echo -e "\n\n${RED}** $(basename $0) error${NC}: $@\n" >&2
+	print_usage
+	exit 1 #Exit on error
+}
+
+# Display a formatted message to shell:
+message() {
+	echo -e "\n** $@" >&2
+}
+
+# Check whether contains aList anItem:
+contains() {
+    if [[ $1 =~ (^|[[:space:]])$2($|[[:space:]]) ]]; then
+     	return 0
+    else
+     	return 1
+    fi
+}
+
+# Check for command presence in $PATH, errors:
+check_command() {
+	TESTCOMMAND=$1
+	HELPTEXT=$2
+
+	printf '%-50s' " - $TESTCOMMAND..."
+	command -v $TESTCOMMAND >/dev/null 2>&1 || {
+		message "${RED}[ MISSING ]${NC}"
+		error "The '$TESTCOMMAND' command was not found. $HELPTEXT"
+	}
+	echo "[ OK ]"
+}
+
+# Test variables for valid values:
+check_config() {
+	PARAM=$1
+	VAR=$2
+	printf '%-50s' " - '$VAR'..."
+	if [[ $PARAM == *"(unset)"* ]]; then
+		echo "[ UNSET ]"
+		error "Please set the gcloud variable '$VAR' via:
+		gcloud config set $VAR <value>"
+	fi
+	echo "[ OK ]"
+}
+
+# Return just the value we're looking for OR unset:
+gcloud_activeconfig_intercept() {
+	gcloud $@ 2>&1 | grep -v "active configuration"
+}
+
+# Enable a single API:
+enable_api() {
+	gcloud services enable $1 >/dev/null 2>&1
+	if [ ! $? -eq 0 ]; then
+		error "cannot enable $1. Please make sure you have privileges to enable this API"
+	fi
+}
+
+# Create a firewall rule enabling traffic to a PORT for instances with a TAG:
+enable_firewall_for_tag() {
+	TESTTAG=$1
+	TESTPORT=$2
+
+	printf '%-50s' " - $TESTTAG..."
+	
+	if [[ ! $(gcloud compute firewall-rules list --format=json|grep $TESTTAG) ]];then
+		echo -e "[CLOSED]"
+		printf "Opening firewall port for "$TESTTAG" ..."
+
+		gcloud compute firewall-rules create  \
+			$TESTTAG \
+			--direction=INGRESS \
+			--priority=1000 \
+			--network=default \
+			--action=ALLOW \
+			--rules=tcp:$TESTPORT \
+			--source-ranges=0.0.0.0/0 \
+			--target-tags=$TESTTAG \
+			> /dev/null 2>&1
+		if [ ! $? -eq 0 ]; then
+			error "Error opening port "$TESTPORT" for tag "$TESTTAG". Please check your privileges."
+		fi
+	else
+		echo -e "[OPEN]"
+	fi
+}
+
+# =============================================================================
+# Base sanity checking
+# =============================================================================
+
+# Check for our required binaries:
+message "Checking for required binaries..."
+check_command gcloud "Please install the Google Cloud SDK from: https://cloud.google.com/sdk/downloads"
+check_command bq "Please install the Google Cloud SDK from: https://cloud.google.com/sdk/downloads"
+check_command gsutil "Please install the Google Cloud SDK from: https://cloud.google.com/sdk/downloads"
+check_command pigz "Please install pigz from your software packager (or zlib.net/pigz)"
+#check_command avrocat "Please install avro-bin from your software packager"
+
+# Execute all the gcloud commands in parallel and then assign them to separate variables:
+# Needed for non-array capable bashes, and for speed.
+message "Checking gcloud variables..."
+PARAMS=$(cat <(gcloud_activeconfig_intercept config get-value compute/region) \
+	<(gcloud_activeconfig_intercept config get-value project) \
+	<(gcloud_activeconfig_intercept auth application-default print-access-token))
+read GCP_ZONE GCP_REGION GCP_PROJECT GCP_AUTHTOKEN <<<$(echo $PARAMS)
+
+# Check for our required gcloud parameters:
+check_config $GCP_PROJECT "project"
+check_config $GCP_REGION "compute/region"
+check_config $GCP_ZONE "compute/zone"
+
+# Check credentials are set:
+printf '%-50s' " - 'application-default access token'..."
+if [[ $GCP_AUTHTOKEN == *"ERROR"* ]]; then
+	echo "[ UNSET ]"
+	error "You do not have application-default credentials set, please run this command:
+	gcloud auth application-default login"
+	exit 1
+fi
+echo "[ OK ]"
+
+# =============================================================================
+# Initialization and idempotent test/setting
+# =============================================================================
+
+# Existing environment
+PROJECT_ID=$(gcloud --format=flattened config list project | awk '{print $2}')	
+BUCKET=$(echo ${PROJECT_ID}-${DATASET} | tr '[:upper:]' '[:lower:]') #bucket name needs lowecase
+DATE=$(echo $(date +%F-%H%M%S))
+THIS_DIR=$(pwd | sed 's/ /\\ /g') #escape spaces
+
+# Bulk parallel process all of the API enablement:
+message "Checking required GCP APIs..."
+
+# Read-in our currently enabled APIs, less the googleapis.com part:
+GCP_CURRENT_APIS=$(gcloud services list | grep -v NAME | cut -f1 -d'.')
+
+# Keep track of whether we modified the API state for friendliness:
+ENABLED_ANY=1
+
+for REQUIRED_API in $REQUIRED_APIS; do
+	if [ $(grep -q $REQUIRED_API <(echo $GCP_CURRENT_APIS))$? -eq 0 ]; then
+		# It's already enabled:
+		printf '%-50s' " - $REQUIRED_API"
+		echo "[ ON ]"
+	else
+		# It needs to be enabled:
+		printf '%-50s' " + $REQUIRED_API"
+		enable_api $REQUIRED_API.googleapis.com &
+		ENABLED_ANY=0
+		echo "[ OFF ]"
+	fi
+done
+
+# If we've enabeld any API, wait for child processes to finish:
+if [ $ENABLED_ANY -eq 0 ]; then
+	printf '%-50s' "**  Concurrently enabling APIs..."
+	wait
+
+else
+	printf '%-50s' "** API status..."
+fi
+echo "[ OK ]"
+
+# =============================================================================
+# Validate arguments and environment including GCS and BQ 
+# =============================================================================
+
+# Argument validation
+# Check at least two positional arguments
+if (( "$#" < 2 )); then 
+	error "At least 2 arguments required, $# provided"
+fi
+
+# Check that DATASET and TABLE exist
+if [ -n "$( bq ls --format=prettyjson -n 10000| grep ${DATASET} )" ]; then
+   message "Dataset ${DATASET} found."
+else
+   error "Dataset ${DATASET} not found. Please check that this dataset exists in project ${PROJECT}"
+fi
+
+if [ -z "$(bq ls --format=prettyjson -n 10000 ${PROJECT}:${DATASET} |grep ${TABLE})" ];then
+	error "Table ${TABLE} not found. Please check that this table exists in dataset ${DATASET}"
+else
+    message "Table ${TABLE} found."
+fi
+
+# Check file format
+if (( "$#" < 3 )); then
+	message "No format specified. Defaulting to "${DEFAULT_FORMAT}
+	FORMAT=${DEFAULT_FORMAT}
+else
+	if contains "${SUPPORTED_FORMATS}" "$3";then
+		FORMAT=$3
+		message "Selected format: "${FORMAT}
+	else
+		error "Format "$3" not supported"
+	fi
+fi
+
+# Check compression format, set extension and tool to be used to decompress
+if [ "$FORMAT" == "AVRO" ]; then
+	COMPRESSION_TYPE="SNAPPY"  #"NONE"
+	EXTENSION="avro"
+	DECOMPRESS_BIN="true" #nothing to do, avro capable clients should read snappy directly
+else
+	COMPRESSION_TYPE="GZIP"
+	EXTENSION="gz"
+	DECOMPRESS_BIN="pigz -d"
+fi
+
+GCS_URI=gs://${BUCKET}/${NAME}"*."${EXTENSION}
+
+# Check that temp bucket ${BUCKET} exists, create if otherwise
+gsutil ls gs://${BUCKET} > /dev/null 2>&1
+if [ $? != 0 ]; then
+	message "Temp bucket "${BUCKET}" not found. Creating it..."
+	gsutil mb gs://${BUCKET} #FIXME: configure region for bucket
+else
+	message "Temp bucket "${BUCKET}" found."
+fi
+
+# =============================================================================
+# Transfer: download table from BQ into GCS, and from GCS into file
+# =============================================================================
+
+# Download BQ table to GCS
+message "Running BigQuery job... "
+bq \
+--location=${LOCATION} \
+extract \
+--destination_format ${FORMAT} \
+--compression ${COMPRESSION_TYPE} \
+--print_header=${PRINT_HEADER} \
+${PROJECT_ID}:${DATASET}"."${TABLE} \
+${GCS_URI}
+#--field_delimiter ${DELIMITER} -- remove: avro does not support it
+
+message "Downloaded from BQ:  "
+message "Dataset: "${DATASET} 
+message "Table: "${TABLE}
+
+# Copy from GCS to local file
+message "Copying to local directory..."
+gsutil \
+${GSUTIL_OPTIONS} \
+cp \
+${GCS_URI} \
+${THIS_DIR}
+
+message "Saved to local directory."
+
+# Clean files from GCS after successful transfer
+# Run in background through nohup
+message "Cleaning temporary storage..."
+nohup \
+gsutil \
+${GSUTIL_OPTIONS} \
+rm -f \
+${GCS_URI} \
+&>/dev/null &
+
+# Decompress locally to be able to load into SAS directly
+message "Decompressing locally..."
+
+# Multithreading unzip to $NUM_THREADS_UNZIP processors
+ls ${NAME}*.${EXTENSION} \
+| xargs --max-procs=${NUM_THREADS_UNZIP} -n 1 \
+${DECOMPRESS_BIN}
+
+# Join pieces together
+message "Assembling parts..."
+cat \
+${NAME}* \
+> \
+${NAME}
+
+# Delete parts and compressed file
+message "Cleaning up parts..."
+#Parts have 000 numbering if existing
+for part in $(ls -1 ${NAME}0*); do
+	rm -f $part
+done 
+
+message "Saved:"
+ls -lah ${NAME}
+
+exit 0
